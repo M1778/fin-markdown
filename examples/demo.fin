@@ -1,0 +1,12 @@
+// fin-markdown example: render a document exercising the v0.1.0 feature
+// set, and print the HTML. Run: finc -I src examples/demo.fin -o demo && ./demo
+import { md_to_html, md_version } from markdown::fin;
+import { free_str } from strings::std;
+
+fun main() <noret> {
+    printf("fin-markdown %s demo\n\n", md_version());
+    let doc <string> = "# fin-markdown demo\n\nA **bold** move, an *italic* aside, and a ~~struck~~ idea, plus `code`.\n\nTriple emphasis: ***very important***.\n\nVisit <https://github.com/M1778/Fin> or [the Fin repo](https://github.com/M1778/Fin).\n\nSee [the docs][docs] for more.\n\n[docs]: https://github.com/M1778/Fin/tree/main/docs\n\n## Lists and code\n\n- first item\n- second item\n\n1. ordered one\n2. ordered two\n\n```fin\nfun hello() <noret> {\n    printf(\"hello, fin!\\n\");\n}\n```\n\n> A wise quote  \n> with a hard break above it.\n\nSetext heading\n==============\n\nAnother\n-------\n\n***\n\nDone.\n";
+    let html <string> = md_to_html(doc);
+    printf("%s", html);
+    free_str(html);
+}

@@ -1,0 +1,702 @@
+// fin-markdown — Markdown → HTML for Fin (v0.1.0).
+//
+// Drop-in replacement for the Markdown subset vendored in fin-ssg's
+// src/vendor/markdown.fin (marked there for replacement). Same public API
+// and same import spelling:
+//   import { md_to_html, md_inline, md_escape_html } from markdown::fin;
+//
+// Block subset:
+//   ATX headings (# … ######, optional closing #'s), setext headings
+//   (=== / --- under a paragraph line), paragraphs, fenced code blocks
+//   (``` with an optional info string -> class="language-x"), unordered
+//   lists (-, *), ordered lists (1.), blockquotes (>), horizontal rules
+//   (---, ***, ___), hard breaks (two trailing spaces -> <br>).
+// Inline subset: `code`, **bold**, *italic*, ***bold italic***,
+// ~~strikethrough~~, [links](url), ![images](url), reference links
+// ([t][id], [t][], [t] with [id]: url definitions anywhere in the
+// document), autolinks (<https://example.com>).
+//
+// Deliberately NOT supported yet: nested lists, tables, indented code
+// blocks, reference images, footnote syntax, headings inside blockquotes
+// beyond inline markup, underscore emphasis (intraword _ is ambiguous),
+// link titles, link-definition lines inside lists/quotes (top-level only).
+// Reference-definition ids match after trim + lowercase (internal
+// whitespace runs are not collapsed). A literal "@@MDBREAK@@" in source
+// text is safe (hard breaks are applied by newline counting, not by a
+// sentinel). One edge case: a code span that spans two paragraph lines
+// shifts hard-break positions after it — hard breaks after such a span
+// may land on the wrong newline.
+//
+// All text is HTML-escaped; code spans and fences are escaped but never
+// inline-processed. Malformed markup degrades to literal text — nothing
+// here aborts (no `blame`): the input is user-authored content.
+//
+// Fin 0.4.0 backend-limit compliance (measured by Builders #1/#2):
+//   * NO `const` declarations at all (not even private ones — they do
+//     not lower through an import); literals only.
+//   * No enum-typed struct fields (MDState holds strings/bools only).
+//   * No Collection<StructType>; reference definitions live in fixed
+//     [string] arrays (cap 512 definitions, 8192 lines per document).
+//   * No null string returns/arguments ("" is the not-found sentinel).
+//   * Only by-name imported calls (strings::std); no @define externs
+//     at all in this module, so nothing depends on extern lowering.
+
+import { len, find, substr, concat, clone, equals, starts_with, ends_with, trim, trim_end, to_lower, index_of_char, is_numeric, free_str, replace } from strings::std;
+
+namespace fin {
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+// Absolute index of `needle` in `s` at or after `start`, or -1.
+fun md_find_from_i(s: string, needle: string, start: int) <int> {
+    if (start < 0) { start = 0; }
+    let total <int> = len(s);
+    if (start >= total) { return -1; }
+    let rel <int> = find(substr(s, start, total - start), needle);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}
+
+// s with the span [from, to_excl) replaced by rep.
+fun md_replace_span(s: string, from_idx: int, to_excl: int, rep: string) <string> {
+    return concat(concat(substr(s, 0, from_idx), rep), substr(s, to_excl, len(s) - to_excl));
+}
+
+// index_of_char at or after `start`, or -1.
+fun md_index_from(s: string, c: char, start: int) <int> {
+    if (start < 0) { start = 0; }
+    let total <int> = len(s);
+    if (start >= total) { return -1; }
+    let rel <int> = index_of_char(substr(s, start, total - start), c);
+    if (rel < 0) { return -1; }
+    return start + rel;
+}
+
+// ---------------------------------------------------------------------------
+// HTML escaping
+// ---------------------------------------------------------------------------
+
+// Escape &, <, > (ampersand first so we never double-escape).
+pub fun md_escape_html(s: string) <string> {
+    let e <string> = replace(s, "&", "&amp;");
+    let e2 <string> = replace(e, "<", "&lt;");
+    return replace(e2, ">", "&gt;");
+}
+
+pub fun md_version() <string> {
+    // clone: callers may free_str the result (a literal must never be freed).
+    return clone("0.1.0");
+}
+
+// ---------------------------------------------------------------------------
+// Inline rendering
+// ---------------------------------------------------------------------------
+
+// Autolinks, expanded on ALREADY-escaped text: "&lt;https://x&gt;" ->
+// <a href="https://x">https://x</a>. Runs after escaping (so a literal
+// "&lt;" typed by the user shows as "&amp;lt;" and never matches) and
+// before images/links (so it cannot eat their brackets).
+fun md_expand_autolinks(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "&lt;", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "&gt;", a + 4);
+        if (b < 0) { break; }
+        let inner <string> = substr(out, a + 4, b - a - 4);
+        if (!starts_with(inner, "http://") && !starts_with(inner, "https://")) { pos = a + 4; continue; }
+        if (find(inner, " ") >= 0) { pos = a + 4; continue; }
+        let rep <string> = concat("<a href=\"", concat(inner, concat("\">", concat(inner, "</a>"))));
+        out = md_replace_span(out, a, b + 4, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_images(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "![", pos);
+        if (a < 0) { break; }
+        let m <int> = md_find_from_i(out, "](", a + 2);
+        if (m < 0) { break; }
+        let b <int> = md_find_from_i(out, ")", m + 2);
+        if (b < 0) { break; }
+        let alt <string> = substr(out, a + 2, m - a - 2);
+        let url <string> = substr(out, m + 2, b - m - 2);
+        let rep <string> = concat("<img src=\"", concat(url, concat("\" alt=\"", concat(alt, "\">"))));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_links(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "[", pos);
+        if (a < 0) { break; }
+        // A leftover image marker (unparseable) is not a link.
+        if (a > 0 && equals(substr(out, a - 1, 1), "!")) { pos = a + 1; continue; }
+        let m <int> = md_find_from_i(out, "](", a + 1);
+        if (m < 0) { pos = a + 1; continue; }
+        let b <int> = md_find_from_i(out, ")", m + 2);
+        if (b < 0) { break; }
+        let text <string> = substr(out, a + 1, m - a - 1);
+        let url <string> = substr(out, m + 2, b - m - 2);
+        let rep <string> = concat("<a href=\"", concat(url, concat("\">", concat(text, "</a>"))));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+// Reference-definition id of a trimmed line ("[id]: url..." -> "id"),
+// or "" when the line is not a definition.
+fun md_def_id(t: string) <string> {
+    if (!starts_with(t, "[")) { return ""; }
+    let c <int> = md_find_from_i(t, "]:", 1);
+    if (c < 0) { return ""; }
+    let id <string> = trim(substr(t, 1, c - 1));
+    if (equals(id, "")) { return ""; }
+    return id;
+}
+
+// Reference-definition url of a trimmed line, or "" when not a definition.
+// Supports "<url>" angle destinations and ignores a trailing title.
+fun md_def_url(t: string) <string> {
+    let c <int> = md_find_from_i(t, "]:", 1);
+    if (c < 0) { return ""; }
+    let rest <string> = trim(substr(t, c + 2, len(t) - c - 2));
+    if (equals(rest, "")) { return ""; }
+    if (starts_with(rest, "<")) {
+        let gt <int> = find(rest, ">");
+        if (gt < 0) { return ""; }
+        return substr(rest, 1, gt - 1);
+    }
+    let sp <int> = find(rest, " ");
+    if (sp < 0) { return rest; }
+    return substr(rest, 0, sp);
+}
+
+fun md_is_link_def(t: string) <bool> {
+    let id <string> = md_def_id(t);
+    if (equals(id, "")) { return false; }
+    let url <string> = md_def_url(t);
+    return !equals(url, "");
+}
+
+// Collect one definition line into ids/urls (lowercased ids, first
+// definition wins). Returns the new count.
+fun md_collect_def(t: string, ids: [string], urls: [string], n: int, cap: int) <int> {
+    let id <string> = md_def_id(t);
+    if (equals(id, "")) { return n; }
+    let key <string> = to_lower(id);
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(ids[i], key)) { return n; }
+    }
+    if (n >= cap) { return n; }
+    let url <string> = md_def_url(t);
+    if (equals(url, "")) { return n; }
+    ids[n] = key;
+    urls[n] = url;
+    return n + 1;
+}
+
+// Url for a definition id (trimmed + lowercased), or "" when undefined.
+fun md_ref_lookup(ids: [string], urls: [string], n: int, id: string) <string> {
+    let key <string> = to_lower(trim(id));
+    for (let i <int> = 0; i < n; i++) {
+        if (equals(ids[i], key)) { return urls[i]; }
+    }
+    return "";
+}
+
+// Reference links: [text][id], [text][] (id = text), [text] (shortcut).
+// Runs after inline links, so [text](url) forms are already consumed.
+fun md_expand_ref_links(s: string, ids: [string], urls: [string], ndefs: int) <string> {
+    if (ndefs <= 0) { return s; }
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "[", pos);
+        if (a < 0) { break; }
+        if (a > 0 && equals(substr(out, a - 1, 1), "!")) { pos = a + 1; continue; }
+        let m <int> = md_find_from_i(out, "]", a + 1);
+        if (m < 0) { break; }
+        if (m == a + 1) { pos = a + 1; continue; }
+        let text <string> = substr(out, a + 1, m - a - 1);
+        let url <string> = "";
+        let end <int> = -1;
+        if (m + 1 < len(out) && equals(substr(out, m + 1, 1), "[")) {
+            let c <int> = md_find_from_i(out, "]", m + 2);
+            if (c < 0) { pos = a + 1; continue; }
+            let idpart <string> = substr(out, m + 2, c - m - 2);
+            if (equals(idpart, "")) { url = md_ref_lookup(ids, urls, ndefs, text); }
+            else { url = md_ref_lookup(ids, urls, ndefs, idpart); }
+            end = c;
+        } else {
+            url = md_ref_lookup(ids, urls, ndefs, text);
+            end = m;
+        }
+        if (equals(url, "")) { pos = a + 1; continue; }
+        let rep <string> = concat("<a href=\"", concat(url, concat("\">", concat(text, "</a>"))));
+        out = md_replace_span(out, a, end + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_bold_italic(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "***", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "***", a + 3);
+        if (b < 0) { break; }
+        if (b == a + 3) { pos = a + 3; continue; }
+        let inner <string> = substr(out, a + 3, b - a - 3);
+        let rep <string> = concat("<strong><em>", concat(inner, "</em></strong>"));
+        out = md_replace_span(out, a, b + 3, rep);
+        pos = a + len(rep);
+    }
+    pos = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "___", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "___", a + 3);
+        if (b < 0) { break; }
+        if (b == a + 3) { pos = a + 3; continue; }
+        let inner <string> = substr(out, a + 3, b - a - 3);
+        let rep <string> = concat("<strong><em>", concat(inner, "</em></strong>"));
+        out = md_replace_span(out, a, b + 3, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_bold(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "**", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "**", a + 2);
+        if (b < 0) { break; }
+        if (b == a + 2) { pos = a + 2; continue; }  // "****": not a bold span
+        let inner <string> = substr(out, a + 2, b - a - 2);
+        let rep <string> = concat("<strong>", concat(inner, "</strong>"));
+        out = md_replace_span(out, a, b + 2, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_italic(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "*", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "*", a + 1);
+        if (b < 0) { break; }
+        if (b == a + 1) { pos = a + 1; continue; }  // "**" remnant: not italic
+        let inner <string> = substr(out, a + 1, b - a - 1);
+        let rep <string> = concat("<em>", concat(inner, "</em>"));
+        out = md_replace_span(out, a, b + 1, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+fun md_expand_strike(s: string) <string> {
+    let out <string> = s;
+    let pos <int> = 0;
+    while (true) {
+        let a <int> = md_find_from_i(out, "~~", pos);
+        if (a < 0) { break; }
+        let b <int> = md_find_from_i(out, "~~", a + 2);
+        if (b < 0) { break; }
+        if (b == a + 2) { pos = a + 2; continue; }  // "~~~~": not a strike span
+        let inner <string> = substr(out, a + 2, b - a - 2);
+        let rep <string> = concat("<del>", concat(inner, "</del>"));
+        out = md_replace_span(out, a, b + 2, rep);
+        pos = a + len(rep);
+    }
+    return out;
+}
+
+// Inline rendering for normal text: escape first, then expand markup.
+// Reference links need the document's definitions (ids/urls/ndefs).
+fun md_inline_doc(s: string, ids: [string], urls: [string], ndefs: int) <string> {
+    let e <string> = md_escape_html(s);
+    let e2 <string> = md_expand_autolinks(e);
+    let e3 <string> = md_expand_images(e2);
+    let e4 <string> = md_expand_links(e3);
+    let e5 <string> = md_expand_ref_links(e4, ids, urls, ndefs);
+    let e6 <string> = md_expand_bold_italic(e5);
+    let e7 <string> = md_expand_bold(e6);
+    let e8 <string> = md_expand_italic(e7);
+    return md_expand_strike(e8);
+}
+
+// Full inline pass with document context: `code` spans are escaped
+// literally, everything else goes through md_inline_doc. An unclosed
+// backtick is literal text.
+fun md_inline_full(s: string, ids: [string], urls: [string], ndefs: int) <string> {
+    let out <string> = clone("");
+    let rest <string> = s;
+    let in_code <bool> = false;
+    while (true) {
+        let bt <int> = find(rest, "`");
+        if (bt < 0) {
+            if (in_code) { out = concat(out, "`"); }  // unclosed: literal
+            out = concat(out, md_inline_doc(rest, ids, urls, ndefs));
+            break;
+        }
+        let part <string> = substr(rest, 0, bt);
+        if (in_code) {
+            out = concat(out, concat("<code>", concat(md_escape_html(part), "</code>")));
+        } else {
+            out = concat(out, md_inline_doc(part, ids, urls, ndefs));
+        }
+        in_code = !in_code;
+        rest = substr(rest, bt + 1, len(rest) - bt - 1);
+    }
+    return out;
+}
+
+// Full inline pass: `code` spans are escaped literally, everything else
+// goes through md_inline_doc. An unclosed backtick is literal text.
+// Standalone (no document context), so reference links do not expand here.
+pub fun md_inline(s: string) <string> {
+    let dummy_ids <[string]> = new [string, 1]{};
+    let dummy_urls <[string]> = new [string, 1]{};
+    let out <string> = md_inline_full(s, dummy_ids, dummy_urls, 0);
+    delete dummy_ids;
+    delete dummy_urls;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Block rendering
+// ---------------------------------------------------------------------------
+
+// Writer state threaded through the block loop. para_flags has one char
+// per paragraph line: "H" when the raw line ended with two spaces (hard
+// break), "S" otherwise.
+struct MDState {
+    html <string>,
+    in_code <bool>,
+    in_ul <bool>,
+    in_ol <bool>,
+    in_quote <bool>,
+    para <string>,
+    para_open <bool>,
+    para_flags <string>
+}
+
+// Apply hard breaks to inline-rendered paragraph HTML: the k-th newline
+// in `html` corresponds to the k-th paragraph line break, and becomes
+// "<br>\n" when that line's flag is "H". (A code span spanning two
+// paragraph lines adds an extra newline and shifts later breaks — the
+// one documented hard-break edge case.)
+fun md_apply_hard_breaks(html: string, flags: string) <string> {
+    let out <string> = "";
+    let rest <string> = html;
+    let idx <int> = 0;
+    while (true) {
+        let nl <int> = index_of_char(rest, '\n');
+        if (nl < 0) { out = concat(out, rest); break; }
+        let seg <string> = substr(rest, 0, nl);
+        out = concat(out, seg);
+        if (idx < len(flags) && equals(substr(flags, idx, 1), "H")) {
+            out = concat(out, "<br>\n");
+        } else {
+            out = concat(out, "\n");
+        }
+        idx = idx + 1;
+        rest = substr(rest, nl + 1, len(rest) - nl - 1);
+    }
+    return out;
+}
+
+fun md_close_para(st: &MDState, ids: [string], urls: [string], ndefs: int) <noret> {
+    if (st.para_open) {
+        let rendered <string> = md_inline_full(st.para, ids, urls, ndefs);
+        let final_html <string> = md_apply_hard_breaks(rendered, st.para_flags);
+        st.html = concat(st.html, concat("<p>", concat(final_html, "</p>\n")));
+        st.para = "";
+        st.para_flags = "";
+        st.para_open = false;
+    }
+}
+
+fun md_close_lists(st: &MDState) <noret> {
+    if (st.in_ul) { st.html = concat(st.html, "</ul>\n"); st.in_ul = false; }
+    if (st.in_ol) { st.html = concat(st.html, "</ol>\n"); st.in_ol = false; }
+}
+
+fun md_close_quote(st: &MDState) <noret> {
+    if (st.in_quote) { st.html = concat(st.html, "</blockquote>\n"); st.in_quote = false; }
+}
+
+fun md_close_all(st: &MDState, ids: [string], urls: [string], ndefs: int) <noret> {
+    md_close_para(st, ids, urls, ndefs);
+    md_close_lists(st);
+    md_close_quote(st);
+}
+
+// Split s into lines (handles \n and \r\n), up to `cap`. Returns the count;
+// lines land in out[0..count).
+fun md_split_lines(s: string, out: [string], cap: int) <int> {
+    let count <int> = 0;
+    let rest <string> = s;
+    while (count < cap) {
+        let nl <int> = index_of_char(rest, '\n');
+        let line_end <int> = len(rest);
+        if (nl >= 0) { line_end = nl; }
+        let line <string> = substr(rest, 0, line_end);
+        if (ends_with(line, "\r")) { line = substr(line, 0, len(line) - 1); }
+        out[count] = line;
+        count = count + 1;
+        if (nl < 0) { break; }
+        rest = substr(rest, nl + 1, len(rest) - nl - 1);
+    }
+    return count;
+}
+
+// True when t consists entirely of the single char c (1+ chars).
+fun md_all_char(t: string, c: string) <bool> {
+    let total <int> = len(t);
+    if (total == 0) { return false; }
+    for (let i <int> = 0; i < total; i++) {
+        if (!equals(substr(t, i, 1), c)) { return false; }
+    }
+    return true;
+}
+
+// Setext level of a trimmed line: 1 for a run of '=', 2 for a run of '-',
+// else 0. (A single char counts: CommonMark allows 1+ underline chars.)
+fun md_setext_level(t: string) <int> {
+    if (md_all_char(t, "=")) { return 1; }
+    if (md_all_char(t, "-")) { return 2; }
+    return 0;
+}
+
+// Thematic break: a run of 3+ of '-', '*', or '_'.
+fun md_is_hr(t: string) <bool> {
+    if (len(t) < 3) { return false; }
+    if (md_all_char(t, "-")) { return true; }
+    if (md_all_char(t, "*")) { return true; }
+    if (md_all_char(t, "_")) { return true; }
+    return false;
+}
+
+// ATX heading level (1-6) when t is "#"+ text, else 0.
+// Requires a space after the #'s, unless the line is only #'s (empty
+// heading, CommonMark rule).
+fun md_heading_level(t: string) <int> {
+    let total <int> = len(t);
+    let level <int> = 0;
+    while (level < total && level < 6) {
+        if (!equals(substr(t, level, 1), "#")) { break; }
+        level = level + 1;
+    }
+    if (level == 0 || level > 6) { return 0; }
+    if (level >= total) { return level; }
+    if (!equals(substr(t, level, 1), " ")) { return 0; }
+    return level;
+}
+
+// Strip an ATX closing sequence ("Title ##" -> "Title"). Only strips
+// when the trailing #'s are preceded by a space, so "C#" survives.
+fun md_strip_closing_hashes(ht: string) <string> {
+    let total <int> = len(ht);
+    let hashes <int> = 0;
+    while (hashes < total) {
+        if (!equals(substr(ht, total - hashes - 1, 1), "#")) { break; }
+        hashes = hashes + 1;
+    }
+    if (hashes == 0) { return ht; }
+    let before <int> = total - hashes - 1;
+    if (before < 0) { return ""; }
+    if (!equals(substr(ht, before, 1), " ")) { return ht; }
+    return trim_end(substr(ht, 0, total - hashes));
+}
+
+fun md_is_ul_item(t: string) <bool> {
+    return starts_with(t, "- ") || starts_with(t, "* ");
+}
+
+// True when t is an ordered-list item ("N. ...", N numeric).
+fun md_is_ol_item(t: string) <bool> {
+    let dot <int> = index_of_char(t, '.');
+    if (dot <= 0) { return false; }
+    if (!is_numeric(substr(t, 0, dot))) { return false; }
+    return starts_with(substr(t, dot, len(t) - dot), ". ");
+}
+
+// Ordered-list item text (after "N. "). Callers check md_is_ol_item first.
+fun md_ol_text(t: string) <string> {
+    let dot <int> = index_of_char(t, '.');
+    return trim(substr(t, dot + 2, len(t) - dot - 2));
+}
+
+// Render a whole Markdown document to an HTML fragment (no <html> wrapper).
+pub fun md_to_html(md: string) <string> {
+    let cap <int> = 8192;
+    let lines <[string]> = new [string, cap]{};
+    let n <int> = md_split_lines(md, lines, cap);
+    // Pre-pass: collect reference-link definitions (fence-aware, so a
+    // definition-looking line inside a fenced block stays code).
+    let defcap <int> = 512;
+    let def_ids <[string]> = new [string, defcap]{};
+    let def_urls <[string]> = new [string, defcap]{};
+    let ndefs <int> = 0;
+    let in_fence <bool> = false;
+    for (let d <int> = 0; d < n; d++) {
+        let dt <string> = trim(lines[d]);
+        if (starts_with(dt, "```")) { in_fence = !in_fence; continue; }
+        if (!in_fence) { ndefs = md_collect_def(dt, def_ids, def_urls, ndefs, defcap); }
+    }
+    let st <MDState> = MDState{
+        html: clone(""),
+        in_code: false,
+        in_ul: false,
+        in_ol: false,
+        in_quote: false,
+        para: "",
+        para_open: false,
+        para_flags: ""
+    };
+    for (let i <int> = 0; i < n; i++) {
+        let raw <string> = lines[i];
+        let t <string> = trim(raw);
+        if (st.in_code) {
+            if (equals(t, "```")) {
+                st.html = concat(st.html, "</code></pre>\n");
+                st.in_code = false;
+            } else {
+                // Raw line: indentation is significant inside code.
+                st.html = concat(st.html, concat(md_escape_html(raw), "\n"));
+            }
+        } else if (equals(t, "")) {
+            md_close_all(&st, def_ids, def_urls, ndefs);
+        } else if (starts_with(t, "```")) {
+            md_close_all(&st, def_ids, def_urls, ndefs);
+            let langfull <string> = trim(substr(t, 3, len(t) - 3));
+            let sp <int> = find(langfull, " ");
+            let lang <string> = langfull;
+            if (sp >= 0) { lang = substr(langfull, 0, sp); }
+            lang = replace(lang, "\"", "");
+            if (equals(lang, "")) {
+                st.html = concat(st.html, "<pre><code>\n");
+            } else {
+                st.html = concat(st.html, concat("<pre><code class=\"language-", concat(md_escape_html(lang), "\">\n")));
+            }
+            st.in_code = true;
+        } else if (md_setext_level(t) > 0 && st.para_open) {
+            // Setext heading: the open paragraph becomes the heading.
+            // (Checked before hr: a "---" run under text is h2, not <hr>.)
+            md_close_lists(&st);
+            md_close_quote(&st);
+            let tag <string> = "h2";
+            if (md_setext_level(t) == 1) { tag = "h1"; }
+            let ht <string> = md_inline_full(st.para, def_ids, def_urls, ndefs);
+            st.html = concat(st.html, concat(concat("<", tag), concat(">", concat(ht, concat("</", concat(tag, ">\n"))))));
+            st.para = "";
+            st.para_flags = "";
+            st.para_open = false;
+        } else if (md_is_hr(t)) {
+            md_close_all(&st, def_ids, def_urls, ndefs);
+            st.html = concat(st.html, "<hr>\n");
+        } else if (md_is_link_def(t)) {
+            // Definition line: consumed by the pre-pass, renders nothing,
+            // and does NOT interrupt an open paragraph.
+        } else if (starts_with(t, ">")) {
+            md_close_para(&st, def_ids, def_urls, ndefs);
+            md_close_lists(&st);
+            if (!st.in_quote) {
+                st.html = concat(st.html, "<blockquote>\n");
+                st.in_quote = true;
+            }
+            let q <string> = trim(substr(t, 1, len(t) - 1));
+            st.html = concat(st.html, concat("<p>", concat(md_inline_full(q, def_ids, def_urls, ndefs), "</p>\n")));
+        } else {
+            md_close_quote(&st);
+            let hl <int> = md_heading_level(t);
+            if (hl > 0) {
+                md_close_all(&st, def_ids, def_urls, ndefs);
+                let ht <string> = "";
+                if (hl < len(t)) {
+                    ht = md_strip_closing_hashes(trim(substr(t, hl + 1, len(t) - hl - 1)));
+                }
+                let tag <string> = "h3";
+                if (hl == 1) { tag = "h1"; }
+                if (hl == 2) { tag = "h2"; }
+                if (hl == 4) { tag = "h4"; }
+                if (hl == 5) { tag = "h5"; }
+                if (hl == 6) { tag = "h6"; }
+                st.html = concat(st.html, concat(concat("<", tag), concat(">", concat(md_inline_full(ht, def_ids, def_urls, ndefs), concat("</", concat(tag, ">\n"))))));
+            } else if (md_is_ul_item(t)) {
+                md_close_para(&st, def_ids, def_urls, ndefs);
+                if (st.in_ol) { md_close_lists(&st); }
+                if (!st.in_ul) {
+                    st.html = concat(st.html, "<ul>\n");
+                    st.in_ul = true;
+                }
+                let item <string> = trim(substr(t, 2, len(t) - 2));
+                st.html = concat(st.html, concat("<li>", concat(md_inline_full(item, def_ids, def_urls, ndefs), "</li>\n")));
+            } else if (md_is_ol_item(t)) {
+                md_close_para(&st, def_ids, def_urls, ndefs);
+                if (st.in_ul) { md_close_lists(&st); }
+                if (!st.in_ol) {
+                    st.html = concat(st.html, "<ol>\n");
+                    st.in_ol = true;
+                }
+                let ol <string> = md_ol_text(t);
+                st.html = concat(st.html, concat("<li>", concat(md_inline_full(ol, def_ids, def_urls, ndefs), "</li>\n")));
+            } else {
+                // Paragraph line: accumulate, join with newline. The flag
+                // records a hard break (raw line ends with two spaces).
+                md_close_lists(&st);
+                let flag <string> = "S";
+                if (ends_with(raw, "  ")) { flag = "H"; }
+                if (st.para_open) {
+                    st.para = concat(st.para, concat("\n", t));
+                    st.para_flags = concat(st.para_flags, flag);
+                } else {
+                    st.para = t;
+                    st.para_flags = flag;
+                    st.para_open = true;
+                }
+            }
+        }
+    }
+    // An unclosed fence still gets its closing tags (degraded, not broken).
+    if (st.in_code) {
+        st.html = concat(st.html, "</code></pre>\n");
+        st.in_code = false;
+    }
+    md_close_all(&st, def_ids, def_urls, ndefs);
+    for (let k <int> = 0; k < n; k++) {
+        free_str(lines[k]);
+    }
+    delete lines;
+    for (let k <int> = 0; k < ndefs; k++) {
+        free_str(def_ids[k]);
+        free_str(def_urls[k]);
+    }
+    delete def_ids;
+    delete def_urls;
+    return st.html;
+}
+
+}

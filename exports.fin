@@ -1,0 +1,12 @@
+// exports.fin — NOTE: `export * from "..."` is NOT valid Fin syntax
+// (verified by Builder #2 against the Fin grammar: no EXPORT token).
+// finn's `init --template library` generates it anyway, aspirationally.
+// This file is documentation of the public API only; CI does NOT run
+// finc on it. Consumers import by name:
+//   import { md_to_html, md_inline, md_escape_html } from markdown::fin;
+//
+// Public API (see README.md / docs/api.md):
+//   md_to_html(md: string) <string>     — full document -> HTML fragment
+//   md_inline(s: string) <string>       — inline markup on one span of text
+//   md_escape_html(s: string) <string>  — escape &, <, >
+//   md_version() <string>               — "0.1.0"

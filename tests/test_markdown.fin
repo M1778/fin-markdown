@@ -1,0 +1,122 @@
+// Tests for fin-markdown. Run: sh tests/run_tests.sh
+// (or: finc -I src tests/test_markdown.fin -o test_markdown && ./test_markdown)
+// Checks are counted, not blame-aborting: every check runs, the summary
+// prints pass/fail totals, and the exit code is 0 only when all pass.
+import { md_to_html, md_inline, md_escape_html, md_version } from markdown::fin;
+import { equals, free_str } from strings::std;
+
+#[llvm_name="exit"]
+@define test_exit(code: int) <noret>;
+
+struct TState {
+    passed <int>,
+    failed <int>
+}
+
+fun check(st: &TState, actual: string, expected: string, name: string) <noret> {
+    if (equals(actual, expected)) {
+        st.passed = st.passed + 1;
+    } else {
+        st.failed = st.failed + 1;
+        printf("FAIL %s\n  expected: %s\n  actual:   %s\n", name, expected, actual);
+    }
+    free_str(actual);
+}
+
+fun main() <noret> {
+    let st <TState> = TState{passed: 0, failed: 0};
+
+    // --- headings (vendored parity + extensions) ---
+    check(&st, md_to_html("# Hi"), "<h1>Hi</h1>\n", "h1");
+    check(&st, md_to_html("## Hi"), "<h2>Hi</h2>\n", "h2");
+    check(&st, md_to_html("### Hi"), "<h3>Hi</h3>\n", "h3");
+    check(&st, md_to_html("#### Hi"), "<h4>Hi</h4>\n", "h4 new");
+    check(&st, md_to_html("##### Hi"), "<h5>Hi</h5>\n", "h5 new");
+    check(&st, md_to_html("###### Hi"), "<h6>Hi</h6>\n", "h6 new");
+    check(&st, md_to_html("####### Hi"), "<p>####### Hi</p>\n", "h7 falls back to paragraph");
+    check(&st, md_to_html("## Title ##"), "<h2>Title</h2>\n", "closing hashes stripped");
+    check(&st, md_to_html("## C#"), "<h2>C#</h2>\n", "closing strip needs space before hashes");
+    check(&st, md_to_html("####"), "<h4></h4>\n", "empty heading");
+    check(&st, md_to_html("# Hello **World**"), "<h1>Hello <strong>World</strong></h1>\n", "heading inline markup");
+
+    // --- setext headings + hr ---
+    check(&st, md_to_html("Title\n==="), "<h1>Title</h1>\n", "setext h1");
+    check(&st, md_to_html("Title\n---"), "<h2>Title</h2>\n", "setext h2 beats hr after paragraph");
+    check(&st, md_to_html("---"), "<hr>\n", "hr dashes alone");
+    check(&st, md_to_html("***"), "<hr>\n", "hr stars");
+    check(&st, md_to_html("___"), "<hr>\n", "hr underscores");
+
+    // --- paragraphs + hard breaks ---
+    check(&st, md_to_html("line one\nline two"), "<p>line one\nline two</p>\n", "soft break stays newline");
+    check(&st, md_to_html("first  \nsecond"), "<p>first<br>\nsecond</p>\n", "hard break two spaces");
+    check(&st, md_to_html("line one\r\nline two"), "<p>line one\nline two</p>\n", "crlf handled");
+    check(&st, md_to_html(""), "", "empty document");
+    check(&st, md_to_html("a <b> & c"), "<p>a &lt;b&gt; &amp; c</p>\n", "escaping in paragraph");
+
+    // --- fenced code ---
+    check(&st, md_to_html("```\nlet x = 1;\n```"), "<pre><code>\nlet x = 1;\n</code></pre>\n", "fence no lang");
+    check(&st, md_to_html("```fin\nlet x = 1;\n```"), "<pre><code class=\"language-fin\">\nlet x = 1;\n</code></pre>\n", "fence lang class");
+    check(&st, md_to_html("```fin extra words\ncode\n```"), "<pre><code class=\"language-fin\">\ncode\n</code></pre>\n", "fence lang first word only");
+    check(&st, md_to_html("```\ncode here"), "<pre><code>\ncode here\n</code></pre>\n", "unclosed fence auto-closes");
+    check(&st, md_to_html("```\n**not bold**\n```"), "<pre><code>\n**not bold**\n</code></pre>\n", "no inline markup in fences");
+
+    // --- lists + quotes ---
+    check(&st, md_to_html("- one\n- two"), "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n", "ul");
+    check(&st, md_to_html("* one\n* two"), "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n", "ul stars");
+    check(&st, md_to_html("1. first\n2. second"), "<ol>\n<li>first</li>\n<li>second</li>\n</ol>\n", "ol");
+    check(&st, md_to_html("10. tenth"), "<ol>\n<li>tenth</li>\n</ol>\n", "ol multi-digit");
+    check(&st, md_to_html("- a\n1. b"), "<ul>\n<li>a</li>\n</ul>\n<ol>\n<li>b</li>\n</ol>\n", "ul to ol switch closes list");
+    check(&st, md_to_html("> quoted"), "<blockquote>\n<p>quoted</p>\n</blockquote>\n", "quote single");
+    check(&st, md_to_html("> one\n> two"), "<blockquote>\n<p>one</p>\n<p>two</p>\n</blockquote>\n", "quote multiline one blockquote");
+    check(&st, md_to_html("> q\n\nplain"), "<blockquote>\n<p>q</p>\n</blockquote>\n<p>plain</p>\n", "quote closes before paragraph");
+    check(&st, md_to_html("> **bold** quote"), "<blockquote>\n<p><strong>bold</strong> quote</p>\n</blockquote>\n", "quote inline markup");
+
+    // --- inline: standalone md_inline ---
+    check(&st, md_inline("**bold**"), "<strong>bold</strong>", "inline bold");
+    check(&st, md_inline("*italic*"), "<em>italic</em>", "inline italic");
+    check(&st, md_inline("***both***"), "<strong><em>both</em></strong>", "inline triple emphasis");
+    check(&st, md_inline("___both___"), "<strong><em>both</em></strong>", "inline triple underscores");
+    check(&st, md_inline("~~gone~~"), "<del>gone</del>", "inline strikethrough");
+    check(&st, md_inline("`code`"), "<code>code</code>", "inline code span");
+    check(&st, md_inline("`**not bold**`"), "<code>**not bold**</code>", "code span shields markup");
+    check(&st, md_inline("`unclosed"), "`unclosed", "unclosed backtick stays literal");
+    check(&st, md_inline("**bold and *italic* inside**"), "<strong>bold and <em>italic</em> inside</strong>", "nested bold italic");
+    check(&st, md_inline("**oops"), "**oops", "unclosed bold stays literal");
+    check(&st, md_inline("[text](https://example.com)"), "<a href=\"https://example.com\">text</a>", "inline link");
+    check(&st, md_inline("![alt](img.png)"), "<img src=\"img.png\" alt=\"alt\">", "inline image");
+    check(&st, md_inline("<https://example.com>"), "<a href=\"https://example.com\">https://example.com</a>", "autolink");
+    check(&st, md_inline("<div>"), "&lt;div&gt;", "angle text is not an autolink");
+    check(&st, md_inline("***x***"), "<strong><em>x</em></strong>", "triple in paragraph context");
+    check(&st, md_escape_html("<a>&"), "&lt;a&gt;&amp;", "escape direct");
+    check(&st, md_version(), "0.1.0", "version");
+
+    // --- reference links ---
+    check(&st, md_to_html("[click][home]\n\n[home]: https://example.com"), "<p><a href=\"https://example.com\">click</a></p>\n", "ref link forward definition");
+    check(&st, md_to_html("[click][]\n\n[click]: https://example.com"), "<p><a href=\"https://example.com\">click</a></p>\n", "ref link empty id");
+    check(&st, md_to_html("[home]\n\n[home]: https://home.test"), "<p><a href=\"https://home.test\">home</a></p>\n", "shortcut ref link");
+    check(&st, md_to_html("[T][ID]\n\n[id]: https://x.test"), "<p><a href=\"https://x.test\">T</a></p>\n", "ref id case-insensitive");
+    check(&st, md_to_html("[x][missing]"), "<p>[x][missing]</p>\n", "undefined ref stays literal");
+    check(&st, md_to_html("[bar]: /u"), "", "definition line renders nothing");
+    check(&st, md_to_html("see [bar]\n[bar]: /u"), "<p>see <a href=\"/u\">bar</a></p>\n", "definition does not interrupt paragraph");
+    check(&st, md_to_html("[a]: <https://angle.test> \"title\"\n\n[a]"), "<p><a href=\"https://angle.test\">a</a></p>\n", "angle destination plus title ignored");
+    check(&st, md_to_html("```\n[a]: /hidden\n```\n\n[a]"), "<pre><code>\n[a]: /hidden\n</code></pre>\n<p>[a]</p>\n", "definition inside fence stays code");
+    check(&st, md_to_html("[dup]: /first\n[dup]: /second\n\n[dup]"), "<p><a href=\"/first\">dup</a></p>\n", "first definition wins");
+
+    // --- setext runs + hr runs (regression: exact "===" match missed runs) ---
+    check(&st, md_to_html("Title\n====="), "<h1>Title</h1>\n", "setext h1 run");
+    check(&st, md_to_html("Title\n-----"), "<h2>Title</h2>\n", "setext h2 run");
+    check(&st, md_to_html("Title\n="), "<h1>Title</h1>\n", "setext h1 single char");
+    check(&st, md_to_html("-----"), "<hr>\n", "hr dash run");
+    check(&st, md_to_html("*****"), "<hr>\n", "hr star run");
+
+    // --- code spans inside block contexts (regression: paragraph path
+    // must use the code-span-aware full pass, not the escape-only pass) ---
+    check(&st, md_to_html("use `code` here"), "<p>use <code>code</code> here</p>\n", "code span in paragraph");
+    check(&st, md_to_html("# Head `code`"), "<h1>Head <code>code</code></h1>\n", "code span in heading");
+    check(&st, md_to_html("- item `code`"), "<ul>\n<li>item <code>code</code></li>\n</ul>\n", "code span in list item");
+    check(&st, md_to_html("> quote `code`"), "<blockquote>\n<p>quote <code>code</code></p>\n</blockquote>\n", "code span in quote");
+    check(&st, md_to_html("`code` and **bold**"), "<p><code>code</code> and <strong>bold</strong></p>\n", "code span beside bold");
+
+    printf("fin-markdown tests: %d passed, %d failed\n", st.passed, st.failed);
+    if (st.failed > 0) { test_exit(1); }
+}

@@ -1,0 +1,21 @@
+# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
+# Module name is `markdown` (src/markdown.fin), NOT src/lib.fin: finn puts
+# every dependency's dir on the finc search path, so two src/lib.fin
+# modules would collide on the module name `lib`. Unique filenames keep
+# `import { md_to_html } from markdown::fin;` working — the exact import
+# spelling fin-ssg's vendored copy used, so this library is a drop-in
+# replacement for it.
+[project]
+name = "fin-markdown"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "markdown.fin"
+
+[registry]
+
+[packages]
+
+[scripts]
+check = "finc -I src src/markdown.fin"
+test = "sh tests/run_tests.sh"
+demo = "finc -I src examples/demo.fin -o demo && ./demo"
